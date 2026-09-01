@@ -1,0 +1,22 @@
+# 个人配置、日志和浏览器凭据
+config.json
+config.invalid-*.json
+campus_watchdog.log*
+edge_campus_profile/
+campus_self_test.json
+
+# Python / build outputs
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.spec
+*.exe
+
+# Editor / OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
