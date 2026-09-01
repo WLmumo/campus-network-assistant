@@ -3,7 +3,7 @@
 
 将本文件放到原 campus_net_watchdog.py 所在目录，即可复用
 edge_campus_profile。配置含学号、网络及监控策略；密码仅由 Edge 管理。
-运行：双击 校园网助手1.1.1.exe，或 py -3.13 campus_net_watchdog_gui.py
+运行：双击 校园网助手1.1.2.exe，或 py -3.13 campus_net_watchdog_gui.py
 依赖：py -3.13 -m pip install requests playwright
 
 Tk 只在主线程使用；所有 Playwright 对象在同一个后台线程创建、
@@ -61,7 +61,7 @@ DISCONNECT_CONFIRM_INTERVAL = 5
 PORTAL_TRIGGER_URL = CONNECTIVITY_URL
 AUTH_FALLBACK_URL = "https://auth1.ysu.edu.cn"
 LOGGER = logging.getLogger("campus_watchdog_gui")
-APP_NAME = "校园网助手1.1.1"
+APP_NAME = "校园网助手1.1.2"
 
 
 @dataclass(frozen=True)
@@ -483,9 +483,78 @@ class RecoveryEngine:
         self.network_confirmed_offline = False
         self.last_probe_detail = ""
         self.last_success_probe = None
+        self._trace_serial = 0
+        self._trace_id = None
+        self._trace_started = None
+        self._trace_step = 0
+        self._trace_last_action = "尚未启动浏览器操作"
 
     def close(self):
+        if getattr(self, "_trace_id", None) is not None:
+            self.finish_recovery_trace(False, browser_ok=None,
+                                       detail="监控停止或后台流程提前结束")
         self.session.close()
+
+    @staticmethod
+    def safe_page_address(page) -> str:
+        """只记录页面定位所需的信息；去掉查询、fragment 和 Portal 分号参数。"""
+        try:
+            address = urlsplit(page.url)
+        except Exception:
+            return "<无法读取页面地址>"
+        scheme = address.scheme or "unknown"
+        host = address.hostname or "<无主机名>"
+        path = (address.path or "/").split(";", 1)[0]
+        # 防止异常页面把过长标识符放进路径并进入日志。
+        path = re.sub(r"(?i)(token|ticket|session|code)[^/]{0,128}", r"\1=<已隐藏>", path)
+        path = re.sub(r"/[A-Za-z0-9_-]{48,}(?=/|$)", "/<长标识已隐藏>", path)
+        return f"{scheme}://{host}{path}"
+
+    def begin_recovery_trace(self, settings: Settings, attempt: int,
+                             failure_limit: int, trigger_reason: str) -> str:
+        """建立一次可关联的恢复记录；不写学号、密码、Cookie 或完整认证 URL。"""
+        if getattr(self, "_trace_id", None) is not None:
+            self.finish_recovery_trace(False, browser_ok=None,
+                                       detail="新的恢复尝试开始前，上一条追踪尚未正常结束")
+        self._trace_serial += 1
+        self._trace_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{self._trace_serial:02d}"
+        self._trace_started = time.monotonic()
+        self._trace_step = 0
+        self._trace_last_action = "建立恢复追踪"
+        self.recovery_log(
+            "开始自动恢复；触发原因=%s；尝试=%s/%s；网络服务=%s；断网探测=%s。",
+            trigger_reason, attempt, failure_limit, settings.service_name,
+            self.last_probe_detail or "无详细结果", level=logging.WARNING)
+        return self._trace_id
+
+    def recovery_log(self, message: str, *args, level=logging.INFO) -> None:
+        """为恢复操作添加追踪编号、步骤序号和相对耗时。"""
+        if getattr(self, "_trace_id", None) is None:
+            LOGGER.log(level, message, *args)
+            return
+        rendered = message % args if args else message
+        self._trace_step += 1
+        elapsed = max(0.0, time.monotonic() - self._trace_started)
+        self._trace_last_action = rendered[:160]
+        LOGGER.log(level, "[恢复 %s | 步骤 %02d | +%.1fs] %s",
+                   self._trace_id, self._trace_step, elapsed, rendered)
+
+    def finish_recovery_trace(self, success: bool, *, browser_ok=None,
+                              detail: str = "") -> None:
+        if getattr(self, "_trace_id", None) is None:
+            return
+        browser_result = ("未取得结果" if browser_ok is None else
+                          "流程返回成功" if browser_ok else "流程未确认成功")
+        result = "恢复成功" if success else "恢复失败"
+        suffix = f"；{detail}" if detail else ""
+        self.recovery_log("结束本次追踪：%s；浏览器=%s；最终探测=%s%s。",
+                          result, browser_result,
+                          self.last_probe_detail or "无详细结果", suffix,
+                          level=logging.INFO if success else logging.WARNING)
+        self._trace_id = None
+        self._trace_started = None
+        self._trace_step = 0
+        self._trace_last_action = "追踪已结束"
 
     def check_stop(self):
         if self.stop.is_set():
@@ -559,13 +628,24 @@ class RecoveryEngine:
         self.emit("network", online=False, confirmed=self.network_confirmed_offline, checked_at=time.time())
         return False
 
-    def confirmed_internet_ok(self) -> bool:
+    def confirmed_internet_ok(self, phase="断网确认") -> bool:
         """自动恢复和失败计数前进行连续复核；取消、单次抖动均不算恢复失败。"""
         for attempt in range(1, DISCONNECT_CONFIRMATIONS + 1):
+            if getattr(self, "_trace_id", None) is not None:
+                self.recovery_log("%s：开始第 %s/%s 轮联网探测。",
+                                  phase, attempt, DISCONNECT_CONFIRMATIONS)
             if self.internet_ok():
+                if getattr(self, "_trace_id", None) is not None:
+                    self.recovery_log("%s：第 %s/%s 轮通过；%s。",
+                                      phase, attempt, DISCONNECT_CONFIRMATIONS,
+                                      self.last_probe_detail)
                 if attempt > 1:
                     LOGGER.info("联网复核已通过，刚才的探测异常未持续，不按持续断网处理。")
                 return True
+            if getattr(self, "_trace_id", None) is not None:
+                self.recovery_log("%s：第 %s/%s 轮未通过；%s。",
+                                  phase, attempt, DISCONNECT_CONFIRMATIONS,
+                                  self.last_probe_detail, level=logging.WARNING)
             if attempt < DISCONNECT_CONFIRMATIONS:
                 LOGGER.warning("联网探测第 %s/%s 轮未通过，%s 秒后复核，暂不启动认证。%s",
                                attempt, DISCONNECT_CONFIRMATIONS, DISCONNECT_CONFIRM_INTERVAL,
@@ -581,11 +661,20 @@ class RecoveryEngine:
         return False
 
     def wait_for_internet(self, page, timeout: float = VERIFY_TIMEOUT) -> bool:
+        started = time.monotonic()
+        checks = 0
+        self.recovery_log("开始等待联网恢复；最长等待 %.1f 秒，每约 2 秒复核一次。", timeout)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            checks += 1
             if self.internet_ok():
+                self.recovery_log("联网等待通过；共探测 %s 次，耗时 %.1f 秒；%s。",
+                                  checks, time.monotonic() - started, self.last_probe_detail)
                 return True
             self.pause(min(2, max(0, deadline - time.monotonic())), page)
+        self.recovery_log("联网等待超时；共探测 %s 次，耗时 %.1f 秒；最后结果=%s。",
+                          checks, time.monotonic() - started,
+                          self.last_probe_detail or "无详细结果", level=logging.WARNING)
         return False
 
     def first_visible(self, locator):
@@ -627,24 +716,54 @@ class RecoveryEngine:
             self.first_visible(page.get_by_text(text, exact=True)) is not None
             for text in ("请选择服务", settings.service_name))
 
-    def goto_safely(self, page, url: str):
+    def describe_page(self, page, settings: Settings) -> str:
+        """返回固定分类，不采集标题、DOM、表单内容或认证参数。"""
+        if self.on_login_page(page):
+            return "统一身份认证登录页"
+        if self.on_service_page(page, settings):
+            return "网络服务选择页"
+        if self.school_page(page):
+            return "学校认证相关页面（未匹配已知控件）"
+        address = urlsplit(page.url)
+        if address.scheme in ("about", "edge", "chrome"):
+            return "浏览器内部页面或空白页"
+        return "非学校页面或未知页面"
+
+    def goto_safely(self, page, url: str, label="目标页面"):
         self.check_stop()
+        self.recovery_log("导航开始：%s；等待页面 DOM，超时上限 %.1f 秒。",
+                          label, NAVIGATION_TIMEOUT_MS / 1000)
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+            response = page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+            status = getattr(response, "status", None)
+            self.recovery_log("导航完成：%s；HTTP 状态=%s；当前页面=%s。",
+                              label, status if status is not None else "无",
+                              self.safe_page_address(page))
         except self.playwright_error as exc:
             # 不把完整 URL、页面内容或浏览器调用参数写入日志。
-            LOGGER.info("导航暂未完成，继续检查页面状态（%s）。", type(exc).__name__)
+            self.recovery_log("导航暂未完成：%s；异常=%s；当前页面=%s；继续识别页面。",
+                              label, type(exc).__name__, self.safe_page_address(page),
+                              level=logging.WARNING)
         self.check_stop()
 
     def trigger_portal(self, page, settings: Settings):
-        LOGGER.info("尝试通过 HTTP 页面触发校园网 Portal...")
-        self.goto_safely(page, PORTAL_TRIGGER_URL)
+        self.recovery_log("尝试通过 Microsoft HTTP 探测页触发校园网 Portal。")
+        self.goto_safely(page, PORTAL_TRIGGER_URL, "Microsoft HTTP Portal 触发页")
+        self.recovery_log("等待 Portal 重定向稳定，持续 2.5 秒。")
         self.pause(2.5, page)
-        if self.on_login_page(page) or self.on_service_page(page, settings) or self.school_page(page):
+        page_type = self.describe_page(page, settings)
+        self.recovery_log("HTTP 触发后的页面识别：%s；当前页面=%s。",
+                          page_type, self.safe_page_address(page))
+        if page_type in ("统一身份认证登录页", "网络服务选择页",
+                          "学校认证相关页面（未匹配已知控件）"):
             return
-        LOGGER.info("未识别到 Portal，尝试直接打开 auth1.ysu.edu.cn...")
-        self.goto_safely(page, AUTH_FALLBACK_URL)
+        self.recovery_log("HTTP 触发后未进入学校页面，改为直接打开认证服务器。",
+                          level=logging.WARNING)
+        self.goto_safely(page, AUTH_FALLBACK_URL, "学校认证服务器")
+        self.recovery_log("等待认证服务器页面稳定，持续 2.5 秒。")
         self.pause(2.5, page)
+        self.recovery_log("直接导航后的页面识别：%s；当前页面=%s。",
+                          self.describe_page(page, settings), self.safe_page_address(page))
 
     def password_ready(self, username_input, password_input, username: str) -> bool:
         self.check_stop()
@@ -656,7 +775,7 @@ class RecoveryEngine:
             return False
 
     def try_saved_password_autofill(self, page, username_input, password_input, settings) -> bool:
-        LOGGER.info("输入学号并尝试调用 Edge 已保存密码...")
+        self.recovery_log("已识别登录表单；开始填写配置中的学号并调用 Edge 已保存密码（日志不记录学号和密码）。")
         self.check_stop()
         # 清空页面上可能残留的旧账号密码，再触发 Edge 对当前学号的填充。
         # 这里只写入空字符串；不会读取或保存任何密码。
@@ -671,9 +790,10 @@ class RecoveryEngine:
         page.keyboard.press("Enter")
         self.pause(1.2, page)
         if self.password_ready(username_input, password_input, settings.username):
-            LOGGER.info("已检测到 Edge 自动填充，且学号与当前配置一致。")
+            self.recovery_log("第一次自动填充检查通过：密码框已有值，页面学号与当前配置一致。")
             return True
-        LOGGER.info("尝试从密码框调用 Edge 已保存密码...")
+        self.recovery_log("第一次自动填充检查未通过；改从密码框调用 Edge 已保存密码。",
+                          level=logging.WARNING)
         password_input.click()
         self.pause(0.5, page)
         page.keyboard.press("ArrowDown")
@@ -681,9 +801,10 @@ class RecoveryEngine:
         page.keyboard.press("Enter")
         self.pause(1.2, page)
         if self.password_ready(username_input, password_input, settings.username):
-            LOGGER.info("已检测到 Edge 自动填充，且学号与当前配置一致。")
+            self.recovery_log("第二次自动填充检查通过：密码框已有值，页面学号与当前配置一致。")
             return True
-        LOGGER.error("密码未自动填充或账号不匹配。请停止监控，使用“配置已保存密码”检查。")
+        self.recovery_log("自动填充失败或页面学号与当前配置不一致；未点击登录。请使用“配置已保存密码”检查。",
+                          level=logging.ERROR)
         return False
 
     def check_seven_day_checkbox(self, page):
@@ -695,38 +816,56 @@ class RecoveryEngine:
             if checkbox is not None:
                 if not checkbox.is_checked():
                     checkbox.check()
+                    self.recovery_log("已勾选“7天免登录”。")
+                else:
+                    self.recovery_log("“7天免登录”原本已勾选，无需修改。")
                 return
             label = self.first_visible(page.get_by_text(re.compile(r"7\s*天免登录")))
             if label is not None:
                 label.click()
                 self.pause(0.3, page)
+                self.recovery_log("已通过文字标签尝试启用“7天免登录”。")
+            else:
+                self.recovery_log("页面未显示“7天免登录”选项，继续登录。")
         except self.playwright_error:
-            LOGGER.info("未能确认“7天免登录”状态，继续登录。")
+            self.recovery_log("未能确认“7天免登录”状态，继续登录。",
+                              level=logging.WARNING)
 
     def click_first(self, candidates, description: str) -> bool:
-        for loc in candidates:
+        for index, loc in enumerate(candidates, 1):
             self.check_stop()
             found = self.first_visible(loc)
             if found is not None:
                 try:
-                    LOGGER.info("%s...", description)
+                    self.recovery_log("已通过候选定位方式 %s/%s 找到控件：%s；准备点击。",
+                                      index, len(candidates), description)
                     found.click()
                     self.check_stop()
+                    self.recovery_log("控件点击完成：%s。", description)
                     return True
-                except self.playwright_error:
+                except self.playwright_error as exc:
+                    self.recovery_log("控件点击未完成：%s；候选方式=%s/%s；异常=%s；继续尝试。",
+                                      description, index, len(candidates), type(exc).__name__,
+                                      level=logging.WARNING)
                     continue
-        LOGGER.error("无法找到或点击按钮：%s", description)
+        self.recovery_log("所有候选定位方式均失败，无法找到或点击：%s。", description,
+                          level=logging.ERROR)
         return False
 
     def click_login(self, page, settings: Settings) -> bool:
         if not self.school_page(page, https_only=True):
-            LOGGER.error("当前不是学校 HTTPS 页面，已停止自动填写学号。")
+            self.recovery_log("当前页面不是学校 HTTPS 页面，已停止自动填写学号；当前页面=%s。",
+                              self.safe_page_address(page), level=logging.ERROR)
             return False
         username_input = self.find_username_input(page)
         password_input = self.find_password_input(page)
         if username_input is None or password_input is None:
-            LOGGER.error("无法识别学号或密码输入框。")
+            self.recovery_log("登录页控件识别失败：学号输入框=%s，密码输入框=%s。",
+                              "已找到" if username_input is not None else "未找到",
+                              "已找到" if password_input is not None else "未找到",
+                              level=logging.ERROR)
             return False
+        self.recovery_log("登录页控件识别完成：学号输入框和密码输入框均已找到。")
         if not self.try_saved_password_autofill(page, username_input, password_input, settings):
             return False
         self.check_seven_day_checkbox(page)
@@ -742,11 +881,13 @@ class RecoveryEngine:
     def click_service_and_confirm(self, page, settings: Settings) -> bool:
         service = self.first_visible(page.get_by_text(settings.service_name, exact=True))
         if service is None:
-            LOGGER.error("没有识别到服务：%s", settings.service_name)
+            self.recovery_log("服务选择失败：页面中没有识别到“%s”。", settings.service_name,
+                              level=logging.ERROR)
             return False
-        LOGGER.info("选择网络服务：%s", settings.service_name)
+        self.recovery_log("已识别目标网络服务“%s”，准备选择。", settings.service_name)
         self.check_stop()
         service.click()
+        self.recovery_log("网络服务选择完成：%s。", settings.service_name)
         self.pause(0.5, page)
         return self.click_first([
             page.get_by_role("button", name=re.compile(r"确\s*定")),
@@ -757,46 +898,77 @@ class RecoveryEngine:
     def handle_portal(self, page, settings: Settings) -> bool:
         deadline = time.monotonic() + 60
         login_attempted = service_attempted = False
+        last_page_type = None
+        self.recovery_log("开始处理认证页面；最长处理 60 秒。")
         while time.monotonic() < deadline:
             self.check_stop()
             if self.internet_ok():
-                LOGGER.info("Internet 已恢复。")
+                self.recovery_log("认证页面处理期间联网探测已通过；%s。", self.last_probe_detail)
                 return True
             self.pause(0.7, page)
-            if self.on_service_page(page, settings) and not service_attempted:
+            page_type = self.describe_page(page, settings)
+            if page_type != last_page_type:
+                self.recovery_log("页面状态变化：%s；当前页面=%s。",
+                                  page_type, self.safe_page_address(page))
+                last_page_type = page_type
+            if page_type == "网络服务选择页" and not service_attempted:
                 service_attempted = True
+                self.recovery_log("进入网络服务选择步骤；目标服务=%s。", settings.service_name)
                 if self.click_service_and_confirm(page, settings):
                     if self.wait_for_internet(page, min(VERIFY_TIMEOUT, max(0, deadline - time.monotonic()))):
-                        LOGGER.info("选择 %s 后 Internet 恢复成功。", settings.service_name)
+                        self.recovery_log("选择 %s 并确认后 Internet 恢复成功。",
+                                          settings.service_name)
                         return True
-                    LOGGER.warning("点击“确定”后暂未恢复 Internet。")
+                    self.recovery_log("点击“确定”后等待期结束，Internet 仍未恢复。",
+                                      level=logging.WARNING)
                 continue
-            if self.on_login_page(page) and not login_attempted:
+            if page_type == "统一身份认证登录页" and not login_attempted:
                 login_attempted = True
+                self.recovery_log("进入统一身份认证登录步骤。")
                 if not self.click_login(page, settings):
                     return False
                 continue
             self.pause(1, page)
-        return self.internet_ok()
+        online = self.internet_ok()
+        self.recovery_log("认证页面处理达到 60 秒上限；最终即时探测=%s；%s。",
+                          "通过" if online else "未通过",
+                          self.last_probe_detail or "无详细结果",
+                          level=logging.INFO if online else logging.WARNING)
+        return online
 
-    def browser_session(self, settings: Settings, setup=False, debug=False) -> bool:
+    def browser_session(self, settings: Settings, setup=False, debug=False, *,
+                        recovery_attempt=None, failure_limit=None,
+                        trigger_reason="自动监控检测") -> bool:
         self.check_stop()
+        profile_existed = self.profile.exists()
+        if not setup and recovery_attempt is not None:
+            self.begin_recovery_trace(settings, recovery_attempt,
+                                      failure_limit or settings.max_failures,
+                                      trigger_reason)
+        if not setup:
+            self.recovery_log("准备专用 Edge Profile；目录状态=%s；不会使用普通 Edge Profile。",
+                              "已存在" if profile_existed else "首次创建")
         self.profile.mkdir(parents=True, exist_ok=True)
         context = None
         with self.sync_playwright() as playwright:
             try:
                 self.check_stop()
+                if not setup:
+                    self.recovery_log("Playwright 已初始化；开始启动 Microsoft Edge 专用实例，最长等待 %.1f 秒。",
+                                      LAUNCH_TIMEOUT_MS / 1000)
                 context = playwright.chromium.launch_persistent_context(
                     user_data_dir=str(self.profile), channel="msedge",
                     headless=False, no_viewport=True, args=["--start-maximized"],
                     timeout=LAUNCH_TIMEOUT_MS,
                 )
                 self.check_stop()
+                if not setup:
+                    self.recovery_log("专用 Edge 启动成功；初始页面数量=%s。", len(context.pages))
                 page = context.pages[0] if context.pages else context.new_page()
                 page.set_default_timeout(ACTION_TIMEOUT_MS)
                 page.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
                 if setup:
-                    self.goto_safely(page, AUTH_FALLBACK_URL)
+                    self.goto_safely(page, AUTH_FALLBACK_URL, "学校认证服务器")
                     LOGGER.info("请在专用 Edge 中手工登录并保存密码；完成后关闭该 Edge 窗口，或点击“结束配置”。")
                     while context.pages:
                         self.check_stop()
@@ -808,33 +980,43 @@ class RecoveryEngine:
                                 break
                             raise
                     return True
-                LOGGER.warning("开始执行校园网自动恢复，使用网络：%s。", settings.service_name)
                 self.trigger_portal(page, settings)
-                # 去除查询、fragment 和分号参数，避免记录认证令牌。
-                url = urlsplit(page.url)
-                LOGGER.info("当前页面：%s://%s%s", url.scheme, url.hostname, url.path.split(";", 1)[0])
+                self.recovery_log("Portal 触发阶段结束；进入页面处理；当前页面=%s。",
+                                  self.safe_page_address(page))
                 ok = self.handle_portal(page, settings)
+                self.recovery_log("浏览器内认证流程返回：%s。",
+                                  "成功" if ok else "未确认成功",
+                                  level=logging.INFO if ok else logging.WARNING)
                 if not ok:
-                    LOGGER.warning("本次恢复未成功；请检查网络、账号保存密码及认证页面。")
+                    self.recovery_log("本次浏览器流程未成功；可能原因包括基础网络、页面结构、账号保存密码或 Portal 状态。",
+                                      level=logging.WARNING)
                     if debug:
-                        LOGGER.info("调试模式：保留浏览器 120 秒；可随时点击停止或关闭脚本。")
+                        self.recovery_log("调试模式：保留浏览器 120 秒；可随时点击停止或关闭脚本。")
                         self.pause(120, page)
                 return ok
             except self.playwright_error as exc:
                 self.check_stop()
                 if type(exc).__name__ == "TargetClosedError":
-                    LOGGER.warning("专用 Edge 页面或连接已提前关闭；可能是窗口被关闭或浏览器退出。将重新探测网络，不以浏览器关闭判定断网。")
+                    self.recovery_log("专用 Edge 页面或连接提前关闭；发生前最后操作=%s。将重新探测网络。",
+                                      self._trace_last_action, level=logging.WARNING)
                 else:
-                    LOGGER.error("浏览器操作失败（%s）。请确认已安装 Edge、专用 Profile 未被旧脚本或其他窗口占用。", type(exc).__name__)
+                    self.recovery_log("浏览器操作失败；异常=%s；发生前最后操作=%s。请确认 Edge 已安装且专用 Profile 未被占用。",
+                                      type(exc).__name__, self._trace_last_action,
+                                      level=logging.ERROR)
                 return False
             finally:
                 if context is not None:
-                    LOGGER.info("正在关闭本程序的专用 Edge，保留已保存密码和登录配置...")
+                    self.recovery_log("开始关闭本程序的专用 Edge；保留 Profile 中已保存的密码和登录配置。")
                     try:
                         # 必须在创建 context 的同一线程关闭，不能由 Tk 线程调用。
                         context.close()
-                    except self.playwright_error:
-                        LOGGER.warning("专用 Edge 已关闭或连接中断。")
+                        self.recovery_log("专用 Edge 已安全关闭。")
+                    except self.playwright_error as exc:
+                        self.recovery_log("关闭专用 Edge 时连接已中断；异常=%s。",
+                                          type(exc).__name__, level=logging.WARNING)
+                elif not setup:
+                    self.recovery_log("专用 Edge 上下文未建立，无需执行浏览器关闭。",
+                                      level=logging.WARNING)
 
 
 class MonitorWorker(threading.Thread):
@@ -901,7 +1083,7 @@ class MonitorWorker(threading.Thread):
             engine = self.engine_factory(self.stop_event, self.emit, self.profile)
             if self.mode == "setup":
                 self.emit("state", text="浏览器配置中")
-                LOGGER.info("打开原脚本专用 Edge 配置目录：%s", self.profile)
+                LOGGER.info("打开 exe 同目录的专用 Edge 配置：%s", self.profile.name)
                 engine.browser_session(self.store.snapshot(), setup=True)
                 return
             settings = self.store.snapshot()
@@ -954,14 +1136,27 @@ class MonitorWorker(threading.Thread):
                     else:
                         engine.check_stop()
                         self.emit("state", text="恢复中")
-                        ok = engine.browser_session(settings, debug=self.debug)
+                        attempt_number = self.consecutive_failures + 1
+                        trigger_reason = ("用户手动立即检测" if manual else
+                                          "启动参数要求强制恢复" if self.force else
+                                          "自动监控确认持续断网")
+                        ok = engine.browser_session(
+                            settings, debug=self.debug,
+                            recovery_attempt=attempt_number,
+                            failure_limit=settings.max_failures,
+                            trigger_reason=trigger_reason)
                         self.force = False
                         engine.check_stop()
                         # 浏览器操作结果不等同于网络状态，再做真实探测。
-                        online = engine.confirmed_internet_ok()
+                        online = engine.confirmed_internet_ok(
+                            phase="浏览器关闭后的最终联网复核")
                         last_probe = self.clock()
                         previous_online = online
                         if online:
+                            finish_trace = getattr(engine, "finish_recovery_trace", None)
+                            if finish_trace is not None:
+                                finish_trace(True, browser_ok=ok,
+                                             detail="连续失败计数将清零")
                             self.consecutive_failures = 0
                             last_failure = None
                             LOGGER.info("自动恢复完成。" if ok else "当前联网探测已通过。")
@@ -969,6 +1164,11 @@ class MonitorWorker(threading.Thread):
                             self.consecutive_failures += 1
                             last_failure = self.clock()
                             settings = self.store.snapshot()
+                            finish_trace = getattr(engine, "finish_recovery_trace", None)
+                            if finish_trace is not None:
+                                finish_trace(False, browser_ok=ok,
+                                             detail=(f"连续失败将记为 "
+                                                     f"{self.consecutive_failures}/{settings.max_failures}"))
                             LOGGER.warning("本次恢复失败；连续失败 %s / %s 次。",
                                            self.consecutive_failures, settings.max_failures)
                             if self._limit_reached(settings):
@@ -1554,12 +1754,37 @@ def run_self_test() -> int:
         with tempfile.TemporaryDirectory(prefix="campus-self-test-") as folder:
             temporary = Path(folder)
             store = ConfigStore(temporary / "config.json")
-            store.save(Settings("TEST_ACCOUNT", "校园网", 45, 15, 2))
-            assert ConfigStore(store.path).snapshot() == Settings("TEST_ACCOUNT", "校园网", 45, 15, 2)
+            store.save(Settings("000000", "校园网", 45, 15, 2))
+            assert ConfigStore(store.path).snapshot() == Settings("000000", "校园网", 45, 15, 2)
             report["checks"].append("config_roundtrip")
             engine = RecoveryEngine(threading.Event(), lambda *args, **kwargs: None,
                                     temporary / "test_profile")
             report["checks"].append("requests_and_playwright_imports")
+            trace_messages = queue.Queue()
+            trace_handler = GUILogHandler(trace_messages)
+            trace_handler.setFormatter(logging.Formatter("%(message)s"))
+            previous_log_level = LOGGER.level
+            LOGGER.setLevel(logging.INFO)
+            LOGGER.addHandler(trace_handler)
+            try:
+                secret = "000000"
+                engine.last_probe_detail = "Microsoft HTTP：模拟失败"
+                trace_id = engine.begin_recovery_trace(
+                    Settings(secret, "校园网"), 1, 2, "离线自检")
+                page_stub = type("PageStub", (), {
+                    "url": "https://auth1.ysu.edu.cn/portal/entry;ticket=PRIVATE?username=" + secret
+                })()
+                engine.recovery_log("页面=%s。", engine.safe_page_address(page_stub))
+                engine.finish_recovery_trace(True, browser_ok=True, detail="离线自检完成")
+                trace_text = "\n".join(item[1] for item in list(trace_messages.queue))
+                assert f"[恢复 {trace_id} | 步骤 01 |" in trace_text
+                assert "结束本次追踪：恢复成功" in trace_text
+                assert secret not in trace_text and "PRIVATE" not in trace_text
+                report["checks"].append("recovery_trace_logging")
+            finally:
+                LOGGER.removeHandler(trace_handler)
+                trace_handler.close()
+                LOGGER.setLevel(previous_log_level)
             import ssl
             ssl.create_default_context(cafile=engine.requests.certs.where())
             report["checks"].append("https_certificate_bundle")
