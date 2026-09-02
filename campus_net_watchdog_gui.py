@@ -3,7 +3,7 @@
 
 将本文件放到原 campus_net_watchdog.py 所在目录，即可复用
 edge_campus_profile。配置含学号、网络及监控策略；密码仅由 Edge 管理。
-运行：双击 校园网助手1.1.2.exe，或 py -3.13 campus_net_watchdog_gui.py
+运行：双击 校园网助手1.2.exe，或 py -3.13 campus_net_watchdog_gui.py
 依赖：py -3.13 -m pip install requests playwright
 
 Tk 只在主线程使用；所有 Playwright 对象在同一个后台线程创建、
@@ -61,7 +61,7 @@ DISCONNECT_CONFIRM_INTERVAL = 5
 PORTAL_TRIGGER_URL = CONNECTIVITY_URL
 AUTH_FALLBACK_URL = "https://auth1.ysu.edu.cn"
 LOGGER = logging.getLogger("campus_watchdog_gui")
-APP_NAME = "校园网助手1.1.2"
+APP_NAME = "校园网助手1.2"
 
 
 @dataclass(frozen=True)
@@ -459,6 +459,238 @@ class StopRequested(Exception):
     pass
 
 
+class WindowsEdgeWindowAPI:
+    """只通过 Win32 处理 Microsoft Edge 顶层窗口，不依赖 pywin32。"""
+
+    HWND_TOPMOST = -1
+    HWND_NOTOPMOST = -2
+    SW_RESTORE = 9
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_NOACTIVATE = 0x0010
+    SWP_SHOWWINDOW = 0x0040
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    GWL_EXSTYLE = -20
+    WS_EX_TOPMOST = 0x00000008
+
+    def __init__(self):
+        self.available = os.name == "nt"
+        self.user = self.kernel = None
+        if not self.available:
+            return
+        from ctypes import wintypes
+        self.wintypes = wintypes
+        self.user = ctypes.WinDLL("user32", use_last_error=True)
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.enum_callback_type = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def signature(dll, name, arguments, result):
+            function = getattr(dll, name)
+            function.argtypes, function.restype = arguments, result
+
+        signature(self.user, "EnumWindows",
+                  [self.enum_callback_type, wintypes.LPARAM], wintypes.BOOL)
+        signature(self.user, "IsWindowVisible", [wintypes.HWND], wintypes.BOOL)
+        signature(self.user, "IsWindow", [wintypes.HWND], wintypes.BOOL)
+        signature(self.user, "IsIconic", [wintypes.HWND], wintypes.BOOL)
+        signature(self.user, "ShowWindow", [wintypes.HWND, ctypes.c_int], wintypes.BOOL)
+        signature(self.user, "GetClassNameW",
+                  [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int)
+        signature(self.user, "GetWindowTextLengthW", [wintypes.HWND], ctypes.c_int)
+        signature(self.user, "GetWindowTextW",
+                  [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int)
+        signature(self.user, "GetWindowThreadProcessId",
+                  [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)], wintypes.DWORD)
+        signature(self.user, "SetWindowPos",
+                  [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                   ctypes.c_int, ctypes.c_int, wintypes.UINT], wintypes.BOOL)
+        signature(self.user, "BringWindowToTop", [wintypes.HWND], wintypes.BOOL)
+        signature(self.user, "SetForegroundWindow", [wintypes.HWND], wintypes.BOOL)
+        signature(self.user, "GetWindowLongW",
+                  [wintypes.HWND, ctypes.c_int], ctypes.c_long)
+        signature(self.kernel, "OpenProcess",
+                  [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE)
+        signature(self.kernel, "QueryFullProcessImageNameW",
+                  [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                   ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL)
+        signature(self.kernel, "CloseHandle", [wintypes.HANDLE], wintypes.BOOL)
+
+    def _process_name(self, hwnd) -> str:
+        if not self.available:
+            return ""
+        pid = self.wintypes.DWORD()
+        self.user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        handle = self.kernel.OpenProcess(
+            self.PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not handle:
+            return ""
+        try:
+            size = self.wintypes.DWORD(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not self.kernel.QueryFullProcessImageNameW(
+                    handle, 0, buffer, ctypes.byref(size)):
+                return ""
+            return Path(buffer.value).name.casefold()
+        finally:
+            self.kernel.CloseHandle(handle)
+
+    def edge_windows(self) -> dict[int, str]:
+        """返回当前可见 Edge 顶层窗口；标题只用于匹配，不写入日志。"""
+        if not self.available:
+            return {}
+        found = {}
+
+        @self.enum_callback_type
+        def callback(hwnd, _):
+            try:
+                if not self.user.IsWindowVisible(hwnd):
+                    return True
+                class_name = ctypes.create_unicode_buffer(128)
+                if not self.user.GetClassNameW(hwnd, class_name, len(class_name)):
+                    return True
+                if not class_name.value.startswith("Chrome_WidgetWin_"):
+                    return True
+                if self._process_name(hwnd) != "msedge.exe":
+                    return True
+                length = min(max(self.user.GetWindowTextLengthW(hwnd), 0), 4096)
+                title = ctypes.create_unicode_buffer(length + 1)
+                self.user.GetWindowTextW(hwnd, title, len(title))
+                found[int(hwnd)] = title.value
+            except Exception:
+                pass
+            return True
+
+        if not self.user.EnumWindows(callback, 0):
+            error = ctypes.get_last_error()
+            if error:
+                raise ctypes.WinError(error)
+        return found
+
+    def pin(self, hwnd: int, activate: bool = False) -> tuple[bool, bool]:
+        """设为 topmost；activate 只在关键步骤尝试，不持续抢占键盘焦点。"""
+        if not self.available or not self.user.IsWindow(hwnd):
+            return False, False
+        if self.user.IsIconic(hwnd):
+            self.user.ShowWindow(hwnd, self.SW_RESTORE)
+        flags = self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_SHOWWINDOW
+        if not activate:
+            flags |= self.SWP_NOACTIVATE
+        topmost = bool(self.user.SetWindowPos(
+            hwnd, self.HWND_TOPMOST, 0, 0, 0, 0, flags))
+        foreground = False
+        if activate:
+            self.user.BringWindowToTop(hwnd)
+            foreground = bool(self.user.SetForegroundWindow(hwnd))
+        return topmost, foreground
+
+    def unpin(self, hwnd: int) -> bool:
+        if not self.available or not self.user.IsWindow(hwnd):
+            return False
+        return bool(self.user.SetWindowPos(
+            hwnd, self.HWND_NOTOPMOST, 0, 0, 0, 0,
+            self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOACTIVATE))
+
+    def is_topmost(self, hwnd: int) -> bool:
+        return bool(self.available and self.user.IsWindow(hwnd) and
+                    self.user.GetWindowLongW(hwnd, self.GWL_EXSTYLE) & self.WS_EX_TOPMOST)
+
+
+class RecoveryWindowKeeper:
+    """锁定本轮脚本新建的 Edge 窗口，并在恢复期间维持置顶。"""
+
+    def __init__(self, stop: threading.Event, api=None, interval: float = 0.75):
+        self.stop = stop
+        self.api = api if api is not None else WindowsEdgeWindowAPI()
+        self.interval = interval
+        self.before_handles = set()
+        self.preexisting_count = 0
+        self.target_hwnd = None
+        self.marker = ""
+        self._finished = threading.Event()
+        self._thread = None
+        self.last_topmost = False
+        self.last_foreground = False
+
+    @property
+    def supported(self) -> bool:
+        return bool(getattr(self.api, "available", False))
+
+    def snapshot_before_launch(self) -> int:
+        windows = self.api.edge_windows() if self.supported else {}
+        self.before_handles = set(windows)
+        self.preexisting_count = len(windows)
+        return self.preexisting_count
+
+    def claim(self, page, marker: str, timeout: float = 5.0) -> bool:
+        """用仅存在于脚本页面的标题标记定位窗口，不猜测或接管外部 Edge。"""
+        if not self.supported:
+            return False
+        self.marker = marker
+        try:
+            page.evaluate("marker => { document.title = marker; }", marker)
+        except Exception:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self.stop.is_set():
+            try:
+                windows = self.api.edge_windows()
+            except Exception:
+                return False
+            matches = [hwnd for hwnd, title in windows.items()
+                       if hwnd not in self.before_handles and marker in title]
+            if matches:
+                self.target_hwnd = matches[0]
+                self.last_topmost, self.last_foreground = self.api.pin(
+                    self.target_hwnd, activate=True)
+                if not self.last_topmost:
+                    self.target_hwnd = None
+                    return False
+                self._thread = threading.Thread(
+                    target=self._keep_topmost,
+                    name="CampusRecoveryWindowKeeper", daemon=True)
+                self._thread.start()
+                return True
+            self._finished.wait(0.1)
+        return False
+
+    def _keep_topmost(self):
+        while not self._finished.wait(self.interval) and not self.stop.is_set():
+            if self.target_hwnd is None:
+                return
+            try:
+                topmost, _ = self.api.pin(self.target_hwnd, activate=False)
+            except Exception:
+                return
+            if not topmost:
+                return
+
+    def bring_forward(self) -> tuple[bool, bool]:
+        if self.target_hwnd is None:
+            return False, False
+        try:
+            self.last_topmost, self.last_foreground = self.api.pin(
+                self.target_hwnd, activate=True)
+        except Exception:
+            self.last_topmost = self.last_foreground = False
+        return self.last_topmost, self.last_foreground
+
+    def release(self) -> bool:
+        self._finished.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+        if self.target_hwnd is None:
+            return False
+        hwnd, self.target_hwnd = self.target_hwnd, None
+        try:
+            return self.api.unpin(hwnd)
+        except Exception:
+            return False
+
+
 class RecoveryEngine:
     """基于原脚本的页面认证流程；实例及其浏览器仅由工作线程持有。"""
 
@@ -488,6 +720,8 @@ class RecoveryEngine:
         self._trace_started = None
         self._trace_step = 0
         self._trace_last_action = "尚未启动浏览器操作"
+        self.window_keeper = None
+        self.recovery_page = None
 
     def close(self):
         if getattr(self, "_trace_id", None) is not None:
@@ -509,6 +743,26 @@ class RecoveryEngine:
         path = re.sub(r"(?i)(token|ticket|session|code)[^/]{0,128}", r"\1=<已隐藏>", path)
         path = re.sub(r"/[A-Za-z0-9_-]{48,}(?=/|$)", "/<长标识已隐藏>", path)
         return f"{scheme}://{host}{path}"
+
+    def bring_recovery_window_forward(self, reason: str) -> bool:
+        """先激活脚本页面标签，再前置已通过标记锁定的脚本窗口。"""
+        keeper = self.window_keeper
+        if keeper is None or keeper.target_hwnd is None:
+            return False
+        try:
+            if self.recovery_page is not None:
+                self.recovery_page.bring_to_front()
+        except self.playwright_error as exc:
+            self.recovery_log("专用 Edge 页面标签激活失败：%s；异常=%s。",
+                              reason, type(exc).__name__, level=logging.WARNING)
+        topmost, foreground = keeper.bring_forward()
+        if topmost:
+            self.recovery_log("专用 Edge 窗口已重新置顶：%s；前台焦点=%s。",
+                              reason, "已取得" if foreground else "受 Windows 限制但仍保持置顶")
+            return True
+        self.recovery_log("专用 Edge 窗口重新置顶失败：%s；继续执行浏览器流程。",
+                          reason, level=logging.WARNING)
+        return False
 
     def begin_recovery_trace(self, settings: Settings, attempt: int,
                              failure_limit: int, trigger_reason: str) -> str:
@@ -731,6 +985,7 @@ class RecoveryEngine:
 
     def goto_safely(self, page, url: str, label="目标页面"):
         self.check_stop()
+        self.bring_recovery_window_forward("准备导航到" + label)
         self.recovery_log("导航开始：%s；等待页面 DOM，超时上限 %.1f 秒。",
                           label, NAVIGATION_TIMEOUT_MS / 1000)
         try:
@@ -745,6 +1000,7 @@ class RecoveryEngine:
                               label, type(exc).__name__, self.safe_page_address(page),
                               level=logging.WARNING)
         self.check_stop()
+        self.bring_recovery_window_forward(label + "导航返回后")
 
     def trigger_portal(self, page, settings: Settings):
         self.recovery_log("尝试通过 Microsoft HTTP 探测页触发校园网 Portal。")
@@ -853,6 +1109,7 @@ class RecoveryEngine:
         return False
 
     def click_login(self, page, settings: Settings) -> bool:
+        self.bring_recovery_window_forward("准备操作统一身份认证登录页")
         if not self.school_page(page, https_only=True):
             self.recovery_log("当前页面不是学校 HTTPS 页面，已停止自动填写学号；当前页面=%s。",
                               self.safe_page_address(page), level=logging.ERROR)
@@ -879,6 +1136,7 @@ class RecoveryEngine:
         return ok
 
     def click_service_and_confirm(self, page, settings: Settings) -> bool:
+        self.bring_recovery_window_forward("准备选择网络服务")
         service = self.first_visible(page.get_by_text(settings.service_name, exact=True))
         if service is None:
             self.recovery_log("服务选择失败：页面中没有识别到“%s”。", settings.service_name,
@@ -950,6 +1208,22 @@ class RecoveryEngine:
                               "已存在" if profile_existed else "首次创建")
         self.profile.mkdir(parents=True, exist_ok=True)
         context = None
+        window_keeper = None
+        if not setup:
+            window_keeper = RecoveryWindowKeeper(self.stop)
+            self.window_keeper = window_keeper
+            try:
+                existing_edge_count = window_keeper.snapshot_before_launch()
+                if window_keeper.supported:
+                    self.recovery_log(
+                        "恢复前发现 %s 个已有 Edge 顶层窗口；这些外部窗口不会被置顶、操作或关闭。",
+                        existing_edge_count)
+                else:
+                    self.recovery_log("当前系统不支持 Win32 窗口置顶；继续执行浏览器恢复流程。",
+                                      level=logging.WARNING)
+            except Exception as exc:
+                self.recovery_log("恢复前 Edge 窗口快照失败；异常=%s；继续执行浏览器恢复流程。",
+                                  type(exc).__name__, level=logging.WARNING)
         with self.sync_playwright() as playwright:
             try:
                 self.check_stop()
@@ -958,7 +1232,10 @@ class RecoveryEngine:
                                       LAUNCH_TIMEOUT_MS / 1000)
                 context = playwright.chromium.launch_persistent_context(
                     user_data_dir=str(self.profile), channel="msedge",
-                    headless=False, no_viewport=True, args=["--start-maximized"],
+                    headless=False, no_viewport=True,
+                    args=["--start-maximized", "--no-first-run",
+                          "--no-default-browser-check", "--disable-background-mode",
+                          "--disable-session-crashed-bubble"],
                     timeout=LAUNCH_TIMEOUT_MS,
                 )
                 self.check_stop()
@@ -967,6 +1244,19 @@ class RecoveryEngine:
                 page = context.pages[0] if context.pages else context.new_page()
                 page.set_default_timeout(ACTION_TIMEOUT_MS)
                 page.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
+                self.recovery_page = page if not setup else None
+                if not setup and window_keeper is not None and window_keeper.supported:
+                    marker = f"{APP_NAME} 自动恢复 {self._trace_id or int(time.time())}"
+                    if window_keeper.claim(page, marker):
+                        page.bring_to_front()
+                        self.recovery_log(
+                            "已通过本轮页面标记锁定脚本专用 Edge 窗口，并在恢复期间持续置顶；外部 Edge 不受影响；前台焦点=%s。",
+                            "已取得" if window_keeper.last_foreground else
+                            "受 Windows 限制但置顶已生效")
+                    else:
+                        self.recovery_log(
+                            "未能唯一锁定脚本专用 Edge 窗口，因此未对任何 Edge 强制置顶；浏览器恢复继续执行。",
+                            level=logging.WARNING)
                 if setup:
                     self.goto_safely(page, AUTH_FALLBACK_URL, "学校认证服务器")
                     LOGGER.info("请在专用 Edge 中手工登录并保存密码；完成后关闭该 Edge 窗口，或点击“结束配置”。")
@@ -1005,6 +1295,16 @@ class RecoveryEngine:
                                       level=logging.ERROR)
                 return False
             finally:
+                if window_keeper is not None:
+                    if window_keeper.target_hwnd is not None:
+                        released = window_keeper.release()
+                        self.recovery_log(
+                            "专用 Edge 持续置顶已结束；窗口层级解除=%s。",
+                            "完成" if released else "窗口可能已提前关闭")
+                    else:
+                        window_keeper.release()
+                    self.window_keeper = None
+                    self.recovery_page = None
                 if context is not None:
                     self.recovery_log("开始关闭本程序的专用 Edge；保留 Profile 中已保存的密码和登录配置。")
                     try:
@@ -1788,20 +2088,32 @@ def run_self_test() -> int:
             import ssl
             ssl.create_default_context(cafile=engine.requests.certs.where())
             report["checks"].append("https_certificate_bundle")
+            window_keeper = None
             with engine.sync_playwright() as playwright:
+                if os.name == "nt":
+                    window_keeper = RecoveryWindowKeeper(engine.stop)
+                    window_keeper.snapshot_before_launch()
                 context = playwright.chromium.launch_persistent_context(
-                    str(engine.profile), channel="msedge", headless=True, timeout=20000,
+                    str(engine.profile), channel="msedge", headless=os.name != "nt", timeout=20000,
                     args=["--host-resolver-rules=MAP * 127.0.0.1, EXCLUDE localhost",
-                          "--no-proxy-server"],
+                          "--no-proxy-server", "--disable-background-mode"],
                 )
                 try:
                     context.route("**/*", lambda route: route.abort())
                     page = context.pages[0] if context.pages else context.new_page()
                     page.set_content("<button onclick=\"this.textContent='OK'\">test</button>")
+                    if window_keeper is not None:
+                        assert window_keeper.claim(
+                            page, APP_NAME + " 窗口置顶自检", timeout=5)
+                        assert window_keeper.target_hwnd is not None
+                        assert window_keeper.api.is_topmost(window_keeper.target_hwnd)
+                        report["checks"].append("recovery_window_topmost_isolation")
                     page.get_by_role("button", name="test").click()
                     assert page.get_by_role("button", name="OK").count() == 1
                     report["checks"].append("edge_driver_and_page_interaction")
                 finally:
+                    if window_keeper is not None:
+                        window_keeper.release()
                     context.close()
             report["checks"].append("edge_cleanup")
         report["passed"] = True

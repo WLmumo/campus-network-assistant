@@ -1,4 +1,4 @@
-# 校园网助手 1.1.2
+# 校园网助手 1.2
 
 一个面向 Windows 的校园网自动重连工具，使用 tkinter 提供 GUI，并通过 Playwright 调用 Microsoft Edge 完成 Portal 认证。
 
@@ -13,6 +13,7 @@
 - Playwright 使用独立 Edge Profile，调用 Edge 已保存密码；源码、配置和日志均不保存密码。
 - GUI 可切换“隐藏正常检测”和“显示全部日志”。过滤只影响窗口，`campus_watchdog.log` 始终保留完整记录。
 - 每次自动恢复生成独立追踪编号，按步骤记录 Edge 启动、Portal 导航、页面识别、登录、服务选择、联网复核、浏览器关闭和阶段耗时，便于排查难以复现的失败。
+- 恢复前记录已有 Edge 窗口，只锁定带本轮页面标记的脚本专用窗口；恢复期间激活正确标签并持续置顶，普通 Edge 不会被点击、置顶或关闭。
 - 点击窗口 X 后隐藏到 Windows 托盘；可通过 GUI 或托盘菜单安全退出。
 
 ## 隐私与安全
@@ -64,6 +65,12 @@ python campus_net_watchdog_gui.py
 
 难以复现问题时，请保留同一个恢复编号从步骤 01 到结束的全部记录，并附上之前的三轮断网确认信息。
 
+## 1.2 专用 Edge 窗口隔离
+
+每轮恢复启动前，程序会记录当前可见的 Edge 顶层窗口。专用 Profile 启动后，程序在自己的页面中写入一次性标记，只锁定“本轮新建且带有该标记”的窗口。锁定成功后，Playwright 先激活正确的标签页，Windows 原生接口再将该窗口设为 topmost，并在恢复期间维持置顶。
+
+已有普通 Edge 和 Windows 后续弹出的其他 Edge 页面都不会被操作或关闭。若无法唯一确认专用窗口，程序会记录警告并放弃强制置顶，不会猜测窗口。恢复结束或异常退出时会解除 topmost，然后关闭专用 Edge。Windows 可能限制跨进程强制取得键盘焦点；这种情况下窗口仍可保持在普通窗口上方。
+
 ## 可选参数
 
 ```text
@@ -88,11 +95,11 @@ python campus_net_watchdog_gui.py
 
 ```powershell
 python -m pip install pyinstaller
-python -m PyInstaller --onefile --windowed --collect-all playwright --name "校园网助手1.1.2" campus_net_watchdog_gui.py
+python -m PyInstaller --onefile --windowed --collect-all playwright --name "校园网助手1.2" campus_net_watchdog_gui.py
 ```
 
 生成的 EXE 未进行数字签名。发布二进制文件时应提供 SHA-256，并明确标注构建来源。
 
 ## 验证范围
 
-1.1.2 版本通过了 48 项自动化回归测试，覆盖配置、网络探测、失败保护、恢复编号与步骤、耗时、URL 脱敏、日志过滤、历史重绘、托盘、停止和退出。打包后的 EXE 也在隔离配置、临时 Edge Profile 和本地模拟页面上完成了恢复追踪、浏览器驱动、托盘及配置保存自检。真实校园网、SSO 过期和 Edge 密码自动填充仍需使用者在本机验证。
+1.2 版本通过了 50 项自动化回归测试，覆盖配置、网络探测、失败保护、恢复编号与步骤、耗时、URL 脱敏、日志过滤、历史重绘、托盘、停止和退出。另用真实 Edge 和临时 Profile 验证带标记窗口的唯一选择、置顶、外部窗口隔离和解除置顶；打包后的 EXE 也完成了恢复追踪、浏览器驱动、托盘及配置保存自检。真实校园网、SSO 过期和 Edge 密码自动填充仍需使用者在本机验证。
