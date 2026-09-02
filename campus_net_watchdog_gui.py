@@ -3,7 +3,7 @@
 
 将本文件放到原 campus_net_watchdog.py 所在目录，即可复用
 edge_campus_profile。配置含学号、网络及监控策略；密码仅由 Edge 管理。
-运行：双击 校园网助手1.2.exe，或 py -3.13 campus_net_watchdog_gui.py
+运行：双击 校园网助手1.2.1.exe，或 py -3.13 campus_net_watchdog_gui.py
 依赖：py -3.13 -m pip install requests playwright
 
 Tk 只在主线程使用；所有 Playwright 对象在同一个后台线程创建、
@@ -61,7 +61,7 @@ DISCONNECT_CONFIRM_INTERVAL = 5
 PORTAL_TRIGGER_URL = CONNECTIVITY_URL
 AUTH_FALLBACK_URL = "https://auth1.ysu.edu.cn"
 LOGGER = logging.getLogger("campus_watchdog_gui")
-APP_NAME = "校园网助手1.2"
+APP_NAME = "校园网助手1.2.1"
 
 
 @dataclass(frozen=True)
@@ -163,7 +163,9 @@ class GUILogHandler(logging.Handler):
 
     def emit(self, record):
         try:
-            item = (record.levelname, self.format(record))
+            # gui_detail 只是窗口显示分类；文件处理器仍保留完整消息。
+            item = (record.levelname, self.format(record),
+                    bool(getattr(record, "gui_detail", False)))
             try:
                 self.messages.put_nowait(item)
             except queue.Full:
@@ -778,20 +780,24 @@ class RecoveryEngine:
         self.recovery_log(
             "开始自动恢复；触发原因=%s；尝试=%s/%s；网络服务=%s；断网探测=%s。",
             trigger_reason, attempt, failure_limit, settings.service_name,
-            self.last_probe_detail or "无详细结果", level=logging.WARNING)
+            self.last_probe_detail or "无详细结果", level=logging.WARNING,
+            gui_detail=False)
         return self._trace_id
 
-    def recovery_log(self, message: str, *args, level=logging.INFO) -> None:
-        """为恢复操作添加追踪编号、步骤序号和相对耗时。"""
+    def recovery_log(self, message: str, *args, level=logging.INFO,
+                     gui_detail: bool = True) -> None:
+        """为恢复操作添加追踪信息，并标记可在 GUI 中隐藏的详细步骤。"""
+        extra = {"gui_detail": bool(gui_detail)}
         if getattr(self, "_trace_id", None) is None:
-            LOGGER.log(level, message, *args)
+            LOGGER.log(level, message, *args, extra=extra)
             return
         rendered = message % args if args else message
         self._trace_step += 1
         elapsed = max(0.0, time.monotonic() - self._trace_started)
         self._trace_last_action = rendered[:160]
         LOGGER.log(level, "[恢复 %s | 步骤 %02d | +%.1fs] %s",
-                   self._trace_id, self._trace_step, elapsed, rendered)
+                   self._trace_id, self._trace_step, elapsed, rendered,
+                   extra=extra)
 
     def finish_recovery_trace(self, success: bool, *, browser_ok=None,
                               detail: str = "") -> None:
@@ -804,7 +810,8 @@ class RecoveryEngine:
         self.recovery_log("结束本次追踪：%s；浏览器=%s；最终探测=%s%s。",
                           result, browser_result,
                           self.last_probe_detail or "无详细结果", suffix,
-                          level=logging.INFO if success else logging.WARNING)
+                          level=logging.INFO if success else logging.WARNING,
+                          gui_detail=False)
         self._trace_id = None
         self._trace_started = None
         self._trace_step = 0
@@ -1097,7 +1104,8 @@ class RecoveryEngine:
                                       index, len(candidates), description)
                     found.click()
                     self.check_stop()
-                    self.recovery_log("控件点击完成：%s。", description)
+                    self.recovery_log("控件点击完成：%s。", description,
+                                      gui_detail=False)
                     return True
                 except self.playwright_error as exc:
                     self.recovery_log("控件点击未完成：%s；候选方式=%s/%s；异常=%s；继续尝试。",
@@ -1145,7 +1153,8 @@ class RecoveryEngine:
         self.recovery_log("已识别目标网络服务“%s”，准备选择。", settings.service_name)
         self.check_stop()
         service.click()
-        self.recovery_log("网络服务选择完成：%s。", settings.service_name)
+        self.recovery_log("网络服务选择完成：%s。", settings.service_name,
+                          gui_detail=False)
         self.pause(0.5, page)
         return self.click_first([
             page.get_by_role("button", name=re.compile(r"确\s*定")),
@@ -1161,28 +1170,32 @@ class RecoveryEngine:
         while time.monotonic() < deadline:
             self.check_stop()
             if self.internet_ok():
-                self.recovery_log("认证页面处理期间联网探测已通过；%s。", self.last_probe_detail)
+                self.recovery_log("认证页面处理期间联网探测已通过；%s。",
+                                  self.last_probe_detail, gui_detail=False)
                 return True
             self.pause(0.7, page)
             page_type = self.describe_page(page, settings)
             if page_type != last_page_type:
                 self.recovery_log("页面状态变化：%s；当前页面=%s。",
-                                  page_type, self.safe_page_address(page))
+                                  page_type, self.safe_page_address(page),
+                                  gui_detail=False)
                 last_page_type = page_type
             if page_type == "网络服务选择页" and not service_attempted:
                 service_attempted = True
-                self.recovery_log("进入网络服务选择步骤；目标服务=%s。", settings.service_name)
+                self.recovery_log("进入网络服务选择步骤；目标服务=%s。",
+                                  settings.service_name, gui_detail=False)
                 if self.click_service_and_confirm(page, settings):
                     if self.wait_for_internet(page, min(VERIFY_TIMEOUT, max(0, deadline - time.monotonic()))):
                         self.recovery_log("选择 %s 并确认后 Internet 恢复成功。",
-                                          settings.service_name)
+                                          settings.service_name, gui_detail=False)
                         return True
                     self.recovery_log("点击“确定”后等待期结束，Internet 仍未恢复。",
                                       level=logging.WARNING)
                 continue
             if page_type == "统一身份认证登录页" and not login_attempted:
                 login_attempted = True
-                self.recovery_log("进入统一身份认证登录步骤。")
+                self.recovery_log("进入统一身份认证登录步骤。",
+                                  gui_detail=False)
                 if not self.click_login(page, settings):
                     return False
                 continue
@@ -1671,7 +1684,7 @@ class CampusApp:
         self._label(log_header, "运行日志", 11, bold=True).pack(side="left")
         self._label(log_header, "  同步写入 campus_watchdog.log", 9, color=self.MUTED).pack(side="left")
         ttk.Checkbutton(log_header, text="自动滚动", variable=self.auto_scroll).pack(side="right")
-        self.log_filter_button = ttk.Button(log_header, text="隐藏正常检测", style="LogFilter.TButton",
+        self.log_filter_button = ttk.Button(log_header, text="隐藏检测与详细步骤", style="LogFilter.TButton",
                                             command=self.toggle_log_filter)
         self.log_filter_button.pack(side="right", padx=(0, 8))
         self.log_text = ScrolledText(log_panel, height=8, wrap="word", state="disabled",
@@ -1722,14 +1735,25 @@ class CampusApp:
     def _visible_log_lines(self, lines):
         if not self.hide_normal_logs:
             return lines
-        return [item for item in lines if not self._routine_normal_log(*item)]
+        visible = []
+        for item in lines:
+            level, message = item[:2]
+            gui_detail = bool(item[2]) if len(item) > 2 else False
+            # 警告和错误始终显示；只隐藏 INFO 级的周期检测和恢复细节。
+            if self._routine_normal_log(level, message):
+                continue
+            if level == "INFO" and gui_detail:
+                continue
+            visible.append(item)
+        return visible
 
     def _append_log_lines(self, lines):
         visible = self._visible_log_lines(lines)
         if not visible:
             return
         self.log_text.configure(state="normal")
-        for level, message in visible:
+        for item in visible:
+            level, message = item[:2]
             self.log_text.insert("end", message + "\n", level)
         line_count = int(self.log_text.index("end-1c").split(".")[0])
         if line_count > 3000:
@@ -1755,7 +1779,8 @@ class CampusApp:
         position = self.log_text.yview()[0]
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
-        for level, message in self._visible_log_lines(self.log_history):
+        for item in self._visible_log_lines(self.log_history):
+            level, message = item[:2]
             self.log_text.insert("end", message + "\n", level)
         self.log_text.configure(state="disabled")
         if self.auto_scroll.get():
@@ -1769,10 +1794,12 @@ class CampusApp:
         # 先接收尚在队列中的日志，确保切换后当前历史完整且不会丢行。
         self._drain_log_queue(limit=10000)
         self.hide_normal_logs = not self.hide_normal_logs
-        self.log_filter_button.configure(text="显示全部日志" if self.hide_normal_logs else "隐藏正常检测")
+        self.log_filter_button.configure(
+            text="显示全部日志" if self.hide_normal_logs else "隐藏检测与详细步骤")
         self._render_log_history()
         LOGGER.info("GUI 日志已切换为%s；campus_watchdog.log 继续记录全部内容。",
-                    "仅显示关键事件" if self.hide_normal_logs else "显示全部")
+                    "仅显示关键事件（已隐藏周期检测和恢复详细步骤）"
+                    if self.hide_normal_logs else "显示全部")
 
     def _schedule_save(self, *_):
         if self.closing:
@@ -2041,6 +2068,20 @@ def run_self_test() -> int:
         assert CampusApp._routine_normal_log("INFO", "Internet 正常。")
         assert not CampusApp._routine_normal_log("INFO", "Internet 已恢复。")
         report["checks"].append("gui_log_filter")
+        sample_lines = [
+            ("INFO", "Internet 正常。", False),
+            ("INFO", "[恢复 TEST | 步骤 02 | +0.1s] 准备专用 Edge。", True),
+            ("INFO", "[恢复 TEST | 步骤 03 | +0.2s] 进入网络服务选择步骤。", False),
+            ("WARNING", "[恢复 TEST | 步骤 04 | +0.3s] 导航异常。", True),
+        ]
+        filter_stub = type("FilterStub", (), {
+            "hide_normal_logs": True,
+            "_routine_normal_log": staticmethod(CampusApp._routine_normal_log),
+        })()
+        visible_sample = CampusApp._visible_log_lines(filter_stub, sample_lines)
+        assert sample_lines[0] not in visible_sample and sample_lines[1] not in visible_sample
+        assert sample_lines[2] in visible_sample and sample_lines[3] in visible_sample
+        report["checks"].append("gui_recovery_detail_filter")
         if os.name == "nt":
             tray = WindowsTray(queue.Queue())
             tray.start()
@@ -2077,9 +2118,11 @@ def run_self_test() -> int:
                 engine.recovery_log("页面=%s。", engine.safe_page_address(page_stub))
                 engine.finish_recovery_trace(True, browser_ok=True, detail="离线自检完成")
                 trace_text = "\n".join(item[1] for item in list(trace_messages.queue))
+                trace_items = list(trace_messages.queue)
                 assert f"[恢复 {trace_id} | 步骤 01 |" in trace_text
                 assert "结束本次追踪：恢复成功" in trace_text
                 assert secret not in trace_text and "PRIVATE" not in trace_text
+                assert [item[2] for item in trace_items] == [False, True, False]
                 report["checks"].append("recovery_trace_logging")
             finally:
                 LOGGER.removeHandler(trace_handler)
@@ -2181,3 +2224,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
